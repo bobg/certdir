@@ -3,117 +3,160 @@ package certdir
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"time"
 
 	"github.com/bobg/errors"
 )
 
-// Run polls a directory for fullchain.pem and privkey.pem files.
-// Each time it finds a newer one of either file,
-// it bundles up their contents as a [tls.Certificate]
-// and passes it to the provided function,
-// which runs in a goroutine.
-// If the function is already running in a goroutine when a new certificate is ready,
-// Run cancels its context and waits for it to return before starting a new goroutine.
+// FromDir produces [tls.Certificate] values from a directory.
+// The directory is polled at the given interval for new fullchain.pem and privkey.pem files.
+// When found, they are bundled up as a [tls.Certificate] and sent on the returned channel.
+// This continues until the context is canceled or an error occurs.
 //
-// If f returns an error, Run returns it,
-// unless the error is [context.Canceled] because Run canceled its context.
-// Otherwise, Run continues until _its_ context is canceled.
-func Run(ctx context.Context, dir string, interval time.Duration, f func(context.Context, tls.Certificate) error) error {
+// The returned error pointer can be used to check for an error in the polling goroutine,
+// but only after the channel is closed.
+func FromDir(ctx context.Context, dir string, interval time.Duration) (<-chan tls.Certificate, *error) {
 	var (
-		last  timePair
-		errCh chan error
+		certfile = filepath.Join(dir, "fullchain.pem")
+		keyfile  = filepath.Join(dir, "privkey.pem")
+		ch       = make(chan tls.Certificate)
+		errptr   = new(error)
 	)
 
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	go func() {
+		defer close(ch)
 
-	// For overall cancellation, e.g. on error return.
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+		var lastCertTime, lastKeyTime time.Time
 
-	// For canceling a single invocation of f.
-	fctx, fcancel := context.WithCancel(ctx)
-	defer fcancel()
-
-	for {
-		next, err := check(dir)
-		if err != nil {
-			return errors.Wrap(err, "checking directory")
-		}
-		if !next.equal(last) {
-			// Cancel the current invocation of f, if there is one.
-
-			if errCh != nil {
-				fcancel()
-				err := <-errCh
-				if err != nil {
-					if !errors.Is(err, context.Canceled) || ctx.Err() != nil {
-						return err
-					}
-				}
-			}
-
-			// Load the new cert and key.
-
-			var (
-				certfile = filepath.Join(dir, "fullchain.pem")
-				keyfile  = filepath.Join(dir, "privkey.pem")
-			)
-			cert, err := tls.LoadX509KeyPair(certfile, keyfile)
+		for {
+			newCertTime, newKeyTime, err := Times(dir)
 			if err != nil {
-				return errors.Wrapf(err, "loading cert and key from %s and %s", certfile, keyfile)
+				*errptr = errors.Wrapf(err, "checking times in %s", dir)
+				return
 			}
 
-			// Start a new invocation of f.
+			if !lastCertTime.Equal(newCertTime) || !lastKeyTime.Equal(newKeyTime) {
+				certpem, err := os.ReadFile(certfile)
+				if err != nil {
+					*errptr = errors.Wrapf(err, "reading %s", certfile)
+					return
+				}
+				keypem, err := os.ReadFile(keyfile)
+				if err != nil {
+					*errptr = errors.Wrapf(err, "reading %s", keyfile)
+					return
+				}
+				cert, err := tls.X509KeyPair(certpem, keypem)
+				if err != nil {
+					*errptr = errors.Wrap(err, "creating certificate object")
+					return
+				}
+				select {
+				case <-ctx.Done():
+					*errptr = errors.Wrap(ctx.Err(), "sending certificate on channel")
+				case ch <- cert:
+				}
 
-			fctx, fcancel = context.WithCancel(ctx)
-			defer fcancel()
+				lastCertTime, lastKeyTime = newCertTime, newKeyTime
+			}
 
-			errCh = make(chan error, 1)
-			go func() {
-				errCh <- f(fctx, cert)
-				close(errCh)
-			}()
+			t := time.NewTimer(interval)
+			defer t.Stop()
 
-			last = next
+			select {
+			case <-ctx.Done():
+				*errptr = ctx.Err()
+			case <-t.C:
+			}
 		}
+	}()
 
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
+	return ch, errptr
+}
 
-		case <-ticker.C:
-			// Continue to the next iteration.
+// FromCommand produces [tls.Certificate] values by running a shell command in a subprocess.
+// The shell command must produce JSON-encoded [X509KeyPair] values on its standard output.
+// A goroutine parses these into certificates and sends them on the returned channel.
+// This continues until the context is canceled or an error occurs.
+//
+// The returned func() error must be called to release resources after the channel is closed.
+// Its result may indicate an error encountered during processing.
+func FromCommand(ctx context.Context, cmdstr string) (<-chan tls.Certificate, func() error, error) {
+	cmd := exec.CommandContext(ctx, "sh", "-c", cmdstr)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "creating stdout pipe")
+	}
 
-		case err := <-errCh:
-			return err
+	if err := cmd.Start(); err != nil {
+		return nil, nil, errors.Wrapf(err, "starting %s", cmd)
+	}
+
+	ch := make(chan tls.Certificate)
+	dec := json.NewDecoder(stdout)
+
+	errptr := new(error)
+
+	go func() {
+		for {
+			var pair X509KeyPair
+			if err := dec.Decode(&pair); err != nil {
+				*errptr = errors.Wrap(err, "decoding JSON")
+				return
+			}
+			cert, err := tls.X509KeyPair(pair.CertPEMBlock, pair.KeyPEMBlock)
+			if err != nil {
+				*errptr = errors.Wrap(err, "creating key pair")
+				return
+			}
+			select {
+			case <-ctx.Done():
+				*errptr = ctx.Err()
+				return
+
+			case ch <- cert:
+			}
 		}
+	}()
+
+	wait := func() error {
+		err := cmd.Wait()
+		if *errptr != nil {
+			return *errptr
+		}
+		return err
 	}
+
+	return ch, wait, nil
 }
 
-type timePair struct {
-	cert, key time.Time
-}
+// Times returns the times of the cert and key files in a directory.
+func Times(dir string) (cert, key time.Time, err error) {
+	var (
+		certfile = filepath.Join(dir, "fullchain.pem")
+		keyfile  = filepath.Join(dir, "privkey.pem")
+	)
 
-func (p timePair) equal(other timePair) bool {
-	return p.cert.Equal(other.cert) && p.key.Equal(other.key)
-}
-
-func check(dir string) (timePair, error) {
-	info, err := os.Stat(filepath.Join(dir, "fullchain.pem"))
+	info, err := os.Stat(certfile)
 	if err != nil {
-		return timePair{}, errors.Wrapf(err, "statting %s/fullchain.pem", dir)
+		return cert, key, errors.Wrapf(err, "statting %s", certfile)
 	}
-	certTime := info.ModTime()
+	cert = info.ModTime()
 
-	info, err = os.Stat(filepath.Join(dir, "privkey.pem"))
+	info, err = os.Stat(keyfile)
 	if err != nil {
-		return timePair{}, errors.Wrapf(err, "statting %s/privkey.pem", dir)
+		return cert, key, errors.Wrapf(err, "statting %s", keyfile)
 	}
-	keyTime := info.ModTime()
+	key = info.ModTime()
 
-	return timePair{cert: certTime, key: keyTime}, nil
+	return cert, key, nil
+}
+
+// X509KeyPair is a pair containing an X.509 certificate and private key, both PEM-encoded.
+type X509KeyPair struct {
+	CertPEMBlock, KeyPEMBlock []byte
 }

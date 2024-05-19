@@ -1,4 +1,4 @@
-module github.com/bobg/certdir
+module github.com/bobg/certs
 
 go 1.21
 
