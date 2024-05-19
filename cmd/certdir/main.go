@@ -16,7 +16,7 @@ import (
 
 	"github.com/bobg/errors"
 
-	"github.com/bobg/certdir"
+	"github.com/bobg/certs"
 )
 
 type timePair struct {
@@ -63,7 +63,7 @@ func run() error {
 	defer ticker.Stop()
 
 	for {
-		newCertTime, newKeyTime, err := certdir.Times(dir)
+		newCertTime, newKeyTime, err := certs.Times(dir)
 		if err != nil {
 			return errors.Wrapf(err, "checking directory %s", dir)
 		}
@@ -79,7 +79,7 @@ func run() error {
 
 			enc := json.NewEncoder(os.Stdout)
 			enc.SetIndent("", "  ")
-			if err = enc.Encode(certdir.X509KeyPair{CertPEMBlock: certpem, KeyPEMBlock: keypem}); err != nil {
+			if err = enc.Encode(certs.X509KeyPair{CertPEMBlock: certpem, KeyPEMBlock: keypem}); err != nil {
 				return errors.Wrap(err, "encoding key pair")
 			}
 

@@ -1,4 +1,4 @@
-package certdir
+package certs
 
 import (
 	"context"
