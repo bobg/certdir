@@ -29,6 +29,7 @@ func FromDir(ctx context.Context, dir string, interval time.Duration) (<-chan tl
 
 	go func() {
 		defer close(ch)
+
 		times, timesErrptr := Times(ctx, dir, interval)
 		for range times {
 			certpem, err := os.ReadFile(certfile)
@@ -82,6 +83,8 @@ func FromCommand(ctx context.Context, cmdstr string) (<-chan tls.Certificate, fu
 	errptr := new(error)
 
 	go func() {
+		defer close(ch)
+
 		for {
 			var pair X509KeyPair
 			if err := dec.Decode(&pair); err != nil {
