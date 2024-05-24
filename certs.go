@@ -77,10 +77,11 @@ func FromCommand(ctx context.Context, cmdstr string) (<-chan tls.Certificate, fu
 		return nil, nil, errors.Wrapf(err, "starting %s", cmd)
 	}
 
-	ch := make(chan tls.Certificate)
-	dec := json.NewDecoder(stdout)
-
-	errptr := new(error)
+	var (
+		ch     = make(chan tls.Certificate)
+		dec    = json.NewDecoder(stdout)
+		errptr = new(error)
+	)
 
 	go func() {
 		defer close(ch)
@@ -108,8 +109,9 @@ func FromCommand(ctx context.Context, cmdstr string) (<-chan tls.Certificate, fu
 
 	wait := func() error {
 		err := cmd.Wait()
+		err = errors.Wrapf(err, "waiting for %s", cmd)
 		if *errptr != nil {
-			return *errptr
+			err = errors.Join(err, *errptr)
 		}
 		return err
 	}
