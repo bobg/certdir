@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -109,7 +110,10 @@ func FromCommand(ctx context.Context, cmdstr string) (<-chan tls.Certificate, fu
 
 	wait := func() error {
 		err := cmd.Wait()
-		err = errors.Wrapf(err, "waiting for %s", cmd)
+		var eerr *exec.ExitError
+		if errors.As(err, &eerr) {
+			err = fmt.Errorf("%s: %s (stderr follows):\n%s", cmd, err, string(eerr.Stderr))
+		}
 		if *errptr != nil {
 			err = errors.Join(err, *errptr)
 		}
