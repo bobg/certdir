@@ -19,14 +19,6 @@ import (
 	"github.com/bobg/certs"
 )
 
-type timePair struct {
-	cert, key time.Time
-}
-
-func (p timePair) equal(other timePair) bool {
-	return p.cert.Equal(other.cert) && p.key.Equal(other.key)
-}
-
 func main() {
 	if err := run(); err != nil {
 		log.Fatal(err)
@@ -55,58 +47,31 @@ func run() error {
 	}()
 
 	var (
-		lastCertTime, lastKeyTime time.Time
-		certfile                  = filepath.Join(dir, "fullchain.pem")
-		keyfile                   = filepath.Join(dir, "privkey.pem")
-		ticker                    = time.NewTicker(interval)
+		certfile = filepath.Join(dir, "fullchain.pem")
+		keyfile  = filepath.Join(dir, "privkey.pem")
 	)
-	defer ticker.Stop()
 
-	for {
-		newCertTime, newKeyTime, err := certs.Times(dir)
+	times, errptr := certs.Times(ctx, dir, interval)
+	for range times {
+		certpem, err := os.ReadFile(certfile)
 		if err != nil {
-			return errors.Wrapf(err, "checking directory %s", dir)
+			return errors.Wrapf(err, "reading %s", certfile)
 		}
-		if !newCertTime.Equal(lastCertTime) || !newKeyTime.Equal(lastKeyTime) {
-			certpem, err := os.ReadFile(certfile)
-			if err != nil {
-				return errors.Wrapf(err, "reading %s", certfile)
-			}
-			keypem, err := os.ReadFile(keyfile)
-			if err != nil {
-				return errors.Wrapf(err, "reading %s", keyfile)
-			}
-
-			enc := json.NewEncoder(os.Stdout)
-			enc.SetIndent("", "  ")
-			if err = enc.Encode(certs.X509KeyPair{CertPEMBlock: certpem, KeyPEMBlock: keypem}); err != nil {
-				return errors.Wrap(err, "encoding key pair")
-			}
-
-			lastCertTime, lastKeyTime = newCertTime, newKeyTime
+		keypem, err := os.ReadFile(keyfile)
+		if err != nil {
+			return errors.Wrapf(err, "reading %s", keyfile)
 		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
 
-		case <-ticker.C:
-			// Wait for the next tick.
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if err = enc.Encode(certs.X509KeyPair{CertPEMBlock: certpem, KeyPEMBlock: keypem}); err != nil {
+			return errors.Wrap(err, "encoding key pair")
 		}
 	}
-}
 
-func check(dir string) (timePair, error) {
-	info, err := os.Stat(filepath.Join(dir, "fullchain.pem"))
-	if err != nil {
-		return timePair{}, errors.Wrapf(err, "statting %s/fullchain.pem", dir)
+	if *errptr != nil {
+		return *errptr
 	}
-	certTime := info.ModTime()
 
-	info, err = os.Stat(filepath.Join(dir, "privkey.pem"))
-	if err != nil {
-		return timePair{}, errors.Wrapf(err, "statting %s/privkey.pem", dir)
-	}
-	keyTime := info.ModTime()
-
-	return timePair{cert: certTime, key: keyTime}, nil
+	return nil
 }

@@ -29,50 +29,30 @@ func FromDir(ctx context.Context, dir string, interval time.Duration) (<-chan tl
 
 	go func() {
 		defer close(ch)
-
-		var lastCertTime, lastKeyTime time.Time
-
-		for {
-			newCertTime, newKeyTime, err := Times(dir)
+		times, timesErrptr := Times(ctx, dir, interval)
+		for range times {
+			certpem, err := os.ReadFile(certfile)
 			if err != nil {
-				*errptr = errors.Wrapf(err, "checking times in %s", dir)
+				*errptr = errors.Wrapf(err, "reading %s", certfile)
 				return
 			}
-
-			if !lastCertTime.Equal(newCertTime) || !lastKeyTime.Equal(newKeyTime) {
-				certpem, err := os.ReadFile(certfile)
-				if err != nil {
-					*errptr = errors.Wrapf(err, "reading %s", certfile)
-					return
-				}
-				keypem, err := os.ReadFile(keyfile)
-				if err != nil {
-					*errptr = errors.Wrapf(err, "reading %s", keyfile)
-					return
-				}
-				cert, err := tls.X509KeyPair(certpem, keypem)
-				if err != nil {
-					*errptr = errors.Wrap(err, "creating certificate object")
-					return
-				}
-				select {
-				case <-ctx.Done():
-					*errptr = errors.Wrap(ctx.Err(), "sending certificate on channel")
-				case ch <- cert:
-				}
-
-				lastCertTime, lastKeyTime = newCertTime, newKeyTime
+			keypem, err := os.ReadFile(keyfile)
+			if err != nil {
+				*errptr = errors.Wrapf(err, "reading %s", keyfile)
+				return
 			}
-
-			t := time.NewTimer(interval)
-			defer t.Stop()
-
+			cert, err := tls.X509KeyPair(certpem, keypem)
+			if err != nil {
+				*errptr = errors.Wrap(err, "creating certificate object")
+				return
+			}
 			select {
 			case <-ctx.Done():
-				*errptr = ctx.Err()
-			case <-t.C:
+				*errptr = errors.Wrap(ctx.Err(), "sending certificate on channel")
+			case ch <- cert:
 			}
 		}
+		*errptr = *timesErrptr
 	}()
 
 	return ch, errptr
@@ -134,26 +114,59 @@ func FromCommand(ctx context.Context, cmdstr string) (<-chan tls.Certificate, fu
 	return ch, wait, nil
 }
 
-// Times returns the times of the cert and key files in a directory.
-func Times(dir string) (cert, key time.Time, err error) {
+// Times returns a channel of timestamps,
+// one for each time the fullchain.pem or privkey.pem file in the given directory is modified.
+func Times(ctx context.Context, dir string, interval time.Duration) (<-chan time.Time, *error) {
 	var (
 		certfile = filepath.Join(dir, "fullchain.pem")
 		keyfile  = filepath.Join(dir, "privkey.pem")
+		errptr   = new(error)
+		ch       = make(chan time.Time)
+		latest   time.Time
 	)
 
-	info, err := os.Stat(certfile)
-	if err != nil {
-		return cert, key, errors.Wrapf(err, "statting %s", certfile)
-	}
-	cert = info.ModTime()
+	go func() {
+		defer close(ch)
 
-	info, err = os.Stat(keyfile)
-	if err != nil {
-		return cert, key, errors.Wrapf(err, "statting %s", keyfile)
-	}
-	key = info.ModTime()
+		for {
+			info, err := os.Stat(certfile)
+			if err != nil {
+				*errptr = errors.Wrapf(err, "statting %s", certfile)
+				return
+			}
+			newLatest := info.ModTime()
 
-	return cert, key, nil
+			info, err = os.Stat(keyfile)
+			if err != nil {
+				*errptr = errors.Wrapf(err, "statting %s", keyfile)
+				return
+			}
+			if newLatest.Before(info.ModTime()) {
+				newLatest = info.ModTime()
+			}
+			if latest.Before(newLatest) {
+				latest = newLatest
+				select {
+				case <-ctx.Done():
+					*errptr = ctx.Err()
+					return
+				case ch <- latest:
+				}
+			}
+
+			timer := time.NewTimer(interval)
+			defer timer.Stop()
+
+			select {
+			case <-ctx.Done():
+				*errptr = ctx.Err()
+				return
+			case <-timer.C:
+			}
+		}
+	}()
+
+	return ch, errptr
 }
 
 // X509KeyPair is a pair containing an X.509 certificate and private key, both PEM-encoded.
