@@ -37,14 +37,20 @@ func run() error {
 
 	dir := flag.Arg(0)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := context.Background()
 
-	go func() {
-		// Cancel the context when standard input closes.
-		io.Copy(io.Discard, os.Stdin)
-		cancel()
-	}()
+	if false {
+		var cancel context.CancelFunc
+
+		ctx, cancel = context.WithCancel(ctx)
+		defer cancel()
+
+		go func() {
+			// Cancel the context when standard input closes.
+			io.Copy(io.Discard, os.Stdin)
+			cancel()
+		}()
+	}
 
 	var (
 		certfile = filepath.Join(dir, "fullchain.pem")
